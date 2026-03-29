@@ -20,6 +20,14 @@ First milestone of the AI SRE agent: an eBPF-based HTTP traffic capture system t
 - Kubernetes pod enrichment
 - Real transport layer (gRPC, message queues, OTLP)
 - AI agent logic or Temporal workflows
+- IPv6 support (IPv4 only for this milestone; IPv6 can be added by widening address fields)
+
+## Known Limitations
+
+- **IPv4 only**: Address fields are 4 bytes. IPv6 (`::1`) connections will not be captured. This is acceptable for initial Docker/WSL2 development where traffic is predominantly IPv4.
+- **First-segment capture only**: HTTP headers/body spanning multiple `read()`/`write()` calls are not reassembled. Only the first segment of a request or response is captured. Continuation reads without an HTTP signature are dropped. This means large headers or chunked transfer encoding may be partially missed.
+- **`/proc` enrichment is best-effort**: Short-lived processes may exit before userspace reads `/proc/{pid}/comm`. The `comm` field will be empty for exited processes.
+- **Syscall noise**: `read`/`write` tracepoints fire for all file descriptors (files, pipes, terminals), not just sockets. Non-socket fds are filtered by checking `conn_info_map` on `sys_enter` (early discard), but there is inherent overhead. `sendto`/`recvfrom` are socket-specific and lower noise.
 
 ## Monorepo Structure
 
@@ -60,15 +68,24 @@ Each top-level directory is an independent module (`go.mod` or `deps.edn`). The 
 
 ### tcp_tracker.c
 
-Uses two attachment points:
+Uses BPF CO-RE (Compile Once, Run Everywhere) with BTF type information via `vmlinux.h` for portable struct access across kernel versions.
 
-1. **Kprobe on `tcp_v4_connect` / tracepoint `tcp_connect`**: captures the fd-to-socket association at connect time, when both `pid_tgid` and the socket's fd are available. Stores `{pid_tgid, fd}` -> socket pointer.
-2. **Tracepoint `inet_sock_set_state`**: fires on TCP state transitions and provides the socket pointer with the full 4-tuple (src/dst IP and port). On ESTABLISHED, enriches the map entry with the 4-tuple. On CLOSE, cleans up the entry.
+Tracks connections using a two-phase approach that correlates fds (available at the syscall layer) with socket 4-tuples (available at the TCP layer):
 
-For accept (server side), attaches a kretprobe on `inet_csk_accept` to capture the new socket and its fd.
+**Client-side (outgoing connections):**
+1. **Tracepoint `sys_enter_connect`**: captures `{pid_tgid, fd}` and the `sockaddr` argument. Stores a temporary entry in `pending_connect_map`: `{pid_tgid, fd}` -> `{sock_addr}`.
+2. **Tracepoint `sys_exit_connect`**: on success (or EINPROGRESS for non-blocking), promotes the pending entry into `conn_info_map` by reading the socket's local address (src ip/port) via the sock pointer obtained from the fd. Removes the pending entry.
 
-- Maintains a BPF hash map: `{pid_tgid, fd}` -> `{src_ip, src_port, dst_ip, dst_port, state}`
-- Entries created on connect/accept, enriched on ESTABLISHED, cleaned up on CLOSE
+**Server-side (incoming connections):**
+1. **Tracepoint `sys_enter_accept4`** (covers both `accept` and `accept4`): saves `pid_tgid` in a scratch map.
+2. **Tracepoint `sys_exit_accept4`**: the return value is the new fd. Reads the new socket's 4-tuple from the kernel `struct sock` (via the fd -> file -> socket -> sock chain, or via `inet_sock_set_state` enrichment). Stores in `conn_info_map`.
+
+**Connection lifecycle:**
+3. **Tracepoint `inet_sock_set_state`**: enriches entries on ESTABLISHED (fills in 4-tuple if not yet complete for non-blocking connects). Cleans up entries on TCP_CLOSE.
+
+- Maintains `conn_info_map` (BPF hash): `{pid_tgid, fd}` -> `{src_ip, src_port, dst_ip, dst_port, state}`
+- Maintains `pending_connect_map` (BPF hash): `{pid_tgid, fd}` -> `{sockaddr, timestamp}` — temporary, cleaned on exit or timeout
+- Entries created on connect/accept syscalls, enriched on ESTABLISHED, cleaned up on CLOSE
 
 ### http_capture.c
 
@@ -78,11 +95,13 @@ Attaches to syscall tracepoints:
 - `sys_enter_sendto`, `sys_exit_sendto`
 - `sys_enter_recvfrom`, `sys_exit_recvfrom`
 
+Also uses BPF CO-RE with `vmlinux.h`.
+
 Behavior:
-- On `sys_enter_*`: saves buffer pointer and fd into a per-CPU map keyed by `{pid_tgid}`
-- On `sys_exit_*`: reads saved buffer pointer, copies first N bytes (configurable, default 512)
+- On `sys_enter_*`: first checks if `{pid_tgid, fd}` exists in `conn_info_map` (early discard for non-socket fds). If found, saves buffer pointer and fd into a per-CPU map keyed by `{pid_tgid}` (unique per-thread since `pid_tgid` encodes both tgid in upper 32 bits and tid in lower 32 bits — a single thread cannot be in two syscalls simultaneously, so this is safe).
+- On `sys_exit_*`: reads saved buffer pointer, copies first `MAX_PAYLOAD_CAPTURE` bytes (compile-time constant, default 512). The BPF verifier requires a static bound for `bpf_probe_read_user`, so the buffer size is fixed at compile time. A logical capture limit can be read from `config_map` to emit fewer bytes, but the read itself is always bounded by the constant.
 - Checks for HTTP signature (`GET `, `POST `, `PUT `, `DELETE `, `HEAD `, `OPTIONS `, `PATCH `, `CONNECT `, `HTTP/1.`)
-- If HTTP detected: looks up connection 4-tuple from `tcp_tracker`'s map, builds event struct, pushes to perf ring buffer
+- If HTTP detected: looks up connection 4-tuple from `tcp_tracker`'s `conn_info_map`, builds event struct, pushes to BPF ring buffer
 - Non-HTTP traffic is dropped in-kernel
 
 ### Shared BPF Maps
@@ -90,30 +109,36 @@ Behavior:
 | Map | Type | Key | Value | Purpose |
 |-----|------|-----|-------|---------|
 | `conn_info_map` | Hash | `{pid_tgid, fd}` | Connection 4-tuple + timestamps | TCP connection tracking |
-| `active_syscall_map` | Per-CPU Hash | `{pid_tgid}` | `{fd, buf_ptr, entry_ts}` | Correlate syscall enter/exit |
-| `events` | Perf Event Array | CPU index | `http_event` struct | Kernel -> userspace channel |
-| `config_map` | Array | index 0 | `{max_capture_bytes}` | Runtime configuration |
+| `pending_connect_map` | Hash | `{pid_tgid, fd}` | `{sockaddr, timestamp}` | Temporary: in-flight connect() calls |
+| `active_syscall_map` | Per-CPU Hash | `{pid_tgid}` | `{fd, buf_ptr, entry_ts}` | Correlate syscall enter/exit (per-thread safe) |
+| `events` | Ring Buffer | N/A (shared) | `http_event` struct | Kernel -> userspace channel |
+| `config_map` | Array | index 0 | `{logical_capture_bytes}` | Runtime config (logical limit, not verifier bound) |
+
+**Why BPF Ring Buffer over Perf Event Array:** Kernel 6.6 supports `BPF_MAP_TYPE_RINGBUF` (available since 5.8). Ring buffers are shared across CPUs (no per-CPU waste), preserve event ordering, support variable-length records, and avoid the wakeup-per-CPU overhead of perf event arrays. The Go collector reads via `cilium/ebpf/ringbuf.Reader` instead of `perf.Reader`.
 
 ### Kernel Event Struct
 
 ```c
-#define MAX_PAYLOAD_CAPTURE 512
+#define MAX_PAYLOAD_CAPTURE 512  // compile-time constant, required by BPF verifier
 
 struct http_event {
     __u64 timestamp_ns;
     __u32 pid;
     __u32 tid;
     __u32 uid;
-    __u32 src_ip;
-    __u32 dst_ip;
+    __u32 src_ip;          // IPv4 only for this milestone
+    __u32 dst_ip;           // IPv4 only for this milestone
     __u16 src_port;
     __u16 dst_port;
-    __u8  direction;      // 0 = request (write/send), 1 = response (read/recv)
-    __u32 payload_len;    // actual bytes transferred by syscall
-    __u32 captured_len;   // bytes captured (min of payload_len, max_capture)
+    __u8  direction;        // 0 = request (write/send), 1 = response (read/recv)
+    __u8  _pad[3];          // explicit padding for alignment before u32 fields
+    __u32 payload_len;      // actual bytes transferred by syscall
+    __u32 captured_len;     // min(payload_len, logical_capture_limit)
     __u8  payload[MAX_PAYLOAD_CAPTURE];
-};
+} __attribute__((packed));
 ```
+
+**Note on packing:** The struct uses `__attribute__((packed))` to ensure the wire format between kernel and userspace is deterministic with no compiler-inserted padding. The Go deserialization must use `binary.Read` with the matching layout (or `encoding/binary.LittleEndian` field-by-field). The explicit `_pad` field before `payload_len` is for documentation — with packed, it's not strictly needed but clarifies intent.
 
 ## Go Userspace Collector
 
@@ -126,9 +151,9 @@ struct http_event {
 
 ### Event Reader (internal/events/)
 
-- Opens perf ring buffer via `cilium/ebpf/perf.Reader`
-- Reads raw `http_event` structs, deserializes into Go structs
-- Tracks and logs lost events (perf buffer overflow)
+- Opens BPF ring buffer via `cilium/ebpf/ringbuf.Reader`
+- Reads raw `http_event` structs, deserializes into Go structs using `binary.Read` matching the packed C struct layout
+- Tracks and logs lost events (ring buffer overflow)
 
 ### Parser (internal/parser/)
 
@@ -156,12 +181,13 @@ Future implementations (gRPC, NATS, OTLP) plug into this interface.
 
 ### Configuration
 
-| Parameter | Default | Source |
-|-----------|---------|--------|
-| Max payload capture size | 512 bytes | Env `AISRE_MAX_CAPTURE` / CLI flag |
-| Perf buffer size | 256 pages | Env `AISRE_PERF_PAGES` / CLI flag |
-| Correlation timeout | 5 seconds | Env `AISRE_CORR_TIMEOUT` / CLI flag |
-| Output format | json | Env `AISRE_OUTPUT` / CLI flag |
+| Parameter | Default | Source | Notes |
+|-----------|---------|--------|-------|
+| Max payload buffer | 512 bytes | Compile-time (`MAX_PAYLOAD_CAPTURE`) | BPF verifier requires static bound; changing requires rebuild |
+| Logical capture limit | 512 bytes | Env `AISRE_MAX_CAPTURE` / CLI flag | Written to `config_map`; must be <= `MAX_PAYLOAD_CAPTURE` |
+| Ring buffer size | 256 pages (1MB) | Env `AISRE_RINGBUF_SIZE` / CLI flag | Allocated at program load time |
+| Correlation timeout | 5 seconds | Env `AISRE_CORR_TIMEOUT` / CLI flag | Unmatched requests evicted after this |
+| Output format | json | Env `AISRE_OUTPUT` / CLI flag | Only `json` supported initially |
 
 ## Protobuf Event Interface
 
@@ -196,11 +222,16 @@ message ConnectionInfo {
   uint32 dst_port = 4;
 }
 
+message Header {
+  string key = 1;
+  string value = 2;
+}
+
 message HTTPRequest {
   string method = 1;
   string path = 2;
   string version = 3;
-  map<string, string> headers = 4;
+  repeated Header headers = 4;  // repeated, not map — HTTP allows duplicate header keys (e.g. Set-Cookie)
   bytes partial_body = 5;
   uint32 total_body_length = 6;
 }
@@ -209,7 +240,7 @@ message HTTPResponse {
   uint32 status_code = 1;
   string status_text = 2;
   string version = 3;
-  map<string, string> headers = 4;
+  repeated Header headers = 4;  // repeated, not map — preserves duplicates and ordering
   bytes partial_body = 5;
   uint32 total_body_length = 6;
 }
