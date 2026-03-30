@@ -1,0 +1,28 @@
+services:
+  ebpf-dev:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.ebpf-dev
+    privileged: true
+    pid: host
+    volumes:
+      - ../..:/workspace
+      - /sys/kernel/btf:/sys/kernel/btf:ro
+      - /sys/kernel/debug:/sys/kernel/debug:ro
+    working_dir: /workspace
+    command: ["sleep", "infinity"]
+
+  test-runner:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.ebpf-dev
+    privileged: true
+    pid: host
+    volumes:
+      - ../..:/workspace
+      - /sys/kernel/btf:/sys/kernel/btf:ro
+      - /sys/kernel/debug:/sys/kernel/debug:ro
+    working_dir: /workspace
+    command: ["sh", "-c", "make generate-vmlinux && make generate-ebpf && make build && make test-integration"]
+    depends_on:
+      - ebpf-dev
