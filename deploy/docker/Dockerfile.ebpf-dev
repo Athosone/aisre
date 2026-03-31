@@ -1,19 +1,25 @@
-FROM ubuntu:24.04
+FROM docker.artifactory.michelin.com/michelin/hub/ubuntu24.04-utils:1.22
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-RUN apt-get update && apt-get install -y \
+USER root
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
     clang \
     llvm \
     libbpf-dev \
     linux-tools-common \
-    bpftool \
     gcc-multilib \
-    make \
-    git \
-    curl \
     protobuf-compiler \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    # Install bpftool from kernel source (linux-tools-common wrapper doesn't work on WSL2)
+    && ln -sf /usr/lib/linux-tools/*/bpftool /usr/sbin/bpftool 2>/dev/null \
+    || true
+
+# Install bpftool binary directly (the apt wrapper fails on WSL2 kernels)
+RUN apt-get update && apt-get install -y --no-install-recommends linux-tools-generic \
+    && rm -rf /var/lib/apt/lists/* \
+    && ls /usr/lib/linux-tools/*/bpftool && ln -sf /usr/lib/linux-tools/*/bpftool /usr/local/bin/bpftool
 
 # Install Go 1.23
 RUN curl -fsSL https://go.dev/dl/go1.23.8.linux-amd64.tar.gz | tar -C /usr/local -xz
