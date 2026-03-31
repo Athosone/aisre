@@ -32,6 +32,7 @@
           llvm
           libbpf
           bpftools
+          bpftrace
           linuxHeaders
 
           # Protobuf

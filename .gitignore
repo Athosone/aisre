@@ -16,3 +16,7 @@ ebpf/c/headers/vmlinux.h
 
 # Build artifacts
 /bin/
+
+# direnv
+.direnv/
+.envrc

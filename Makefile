@@ -1,4 +1,8 @@
-.PHONY: generate build test test-integration test-smoke docker-build clean
+.PHONY: generate build test test-integration test-smoke docker-build compile-bpf clean
+
+# Unwrapped clang (Nix-wrapped clang injects flags incompatible with -target bpf)
+CLANG ?= $(shell find /nix/store -maxdepth 3 -name 'clang' -path '*/bin/clang' ! -path '*wrapper*' 2>/dev/null | head -1)
+BPF_CFLAGS := -target bpf -O2 -g -Wall -I ebpf/c $(shell pkg-config --cflags libbpf)
 
 DOCKER_COMPOSE := docker compose -f deploy/docker/docker-compose.yml
 
@@ -9,6 +13,14 @@ generate-vmlinux:
 # Generate protobuf Go code
 generate-proto:
 	protoc --go_out=. --go_opt=module=github.com/athosone/aisre proto/events/v1/http.proto
+
+# Compile eBPF C programs directly (useful for quick error checking without bpf2go)
+# Requires: nix develop (for unwrapped clang + libbpf headers)
+compile-bpf:
+	@test -n "$(CLANG)" || (echo "ERROR: unwrapped clang not found in /nix/store. Run: nix develop" && exit 1)
+	@echo "Using clang: $(CLANG)"
+	$(CLANG) $(BPF_CFLAGS) -c ebpf/c/tcp_tracker.c -o /tmp/tcp_tracker.o
+	@echo "tcp_tracker.c compiled OK -> /tmp/tcp_tracker.o"
 
 # Run bpf2go to compile eBPF C and generate Go bindings
 generate-ebpf:
