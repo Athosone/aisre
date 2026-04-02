@@ -29,6 +29,7 @@
 
           # eBPF toolchain
           clang
+          llvmPackages.clang-unwrapped # unwrapped clang for BPF target (no nix hardening flags)
           llvm
           libbpf
           bpftools
@@ -46,9 +47,12 @@
         ];
 
         shellHook = ''
+          export BPF_CLANG="${pkgs.llvmPackages.clang-unwrapped}/bin/clang"
+          export BPF_CFLAGS="-O2 -g -target bpf -I ${pkgs.libbpf}/include -I ./ebpf/c"
           echo "aisre dev shell loaded"
           echo "  Go:       $(go version)"
           echo "  Clang:    $(clang --version | head -1)"
+          echo "  BPF Clang: $BPF_CLANG"
           echo "  Protoc:   $(protoc --version)"
         '';
 
