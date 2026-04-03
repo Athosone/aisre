@@ -28,7 +28,7 @@ struct conn_info {
 // Scratch space for correlating syscall enter/exit
 struct active_syscall {
     __u32 fd;
-    const char *buf_ptr;
+    __u64 buf_ptr;  // userspace pointer stored as integer (pointers not supported by bpf2go)
     __u64 entry_ts;
 };
 
@@ -60,6 +60,12 @@ struct http_event {
     __u32 captured_len;
     __u8  payload[MAX_PAYLOAD_CAPTURE];
 } __attribute__((packed));
+
+// Per-CPU scratch buffer for payload reads — avoids putting __u8[512] on the
+// 512-byte BPF stack, which would immediately overflow it.
+struct payload_scratch_val {
+    __u8 data[MAX_PAYLOAD_CAPTURE];
+};
 
 // --- Shared maps ---
 
@@ -95,5 +101,12 @@ struct {
     __type(key, __u32);
     __type(value, struct config);
 } config_map SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct payload_scratch_val);
+} payload_scratch SEC(".maps");
 
 #endif /* __COMMON_H__ */

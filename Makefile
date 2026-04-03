@@ -24,7 +24,8 @@ compile-bpf:
 
 # Run bpf2go to compile eBPF C and generate Go bindings
 generate-ebpf:
-	cd ebpf && go generate ./...
+	@test -n "$(CLANG)" || (echo "ERROR: unwrapped clang not found in /nix/store. Run: nix develop" && exit 1)
+	cd ebpf && CC=$(CLANG) go generate ./...
 
 generate: generate-proto generate-ebpf
 

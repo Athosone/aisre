@@ -1,0 +1,23 @@
+{
+    "configurations": [
+        {
+            "name": "eBPF",
+            "includePath": [
+                "${workspaceFolder}/ebpf/c",
+                "/nix/store/0y6byys2fd1xzq66vld217g7y69kvqa1-libbpf-1.6.3/include"
+            ],
+            "defines": [
+                "__TARGET_ARCH_x86",
+                "__BPF_TRACING__"
+            ],
+            "compilerPath": "/nix/store/zb8py6p8qq01nygnnf8jrnkps9nna189-clang-21.1.8/bin/clang",
+            "compilerArgs": [
+                "-target",
+                "bpf"
+            ],
+            "cStandard": "c11",
+            "intelliSenseMode": "linux-clang-x64"
+        }
+    ],
+    "version": 4
+}

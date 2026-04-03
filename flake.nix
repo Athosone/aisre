@@ -49,6 +49,7 @@
         shellHook = ''
           export BPF_CLANG="${pkgs.llvmPackages.clang-unwrapped}/bin/clang"
           export BPF_CFLAGS="-O2 -g -target bpf -I ${pkgs.libbpf}/include -I ./ebpf/c"
+          export CC="$BPF_CLANG"
           echo "aisre dev shell loaded"
           echo "  Go:       $(go version)"
           echo "  Clang:    $(clang --version | head -1)"
