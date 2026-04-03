@@ -92,7 +92,7 @@ static __always_inline __u64 fd_to_skaddr(__u32 fd) {
     // Variable-index read: fds[fd].  bpf_probe_read_kernel is safe for this;
     // BPF_CORE_READ cannot express a runtime index.
     struct file *f = NULL;
-    if (bpf_probe_read_kernel(&f, sizeof(f), fds + fd) < 0 || !f)
+    if (bpf_probe_read_kernel(&f, sizeof(*fds), fds + fd) < 0 || !f)
         return 0;
 
     // private_data for a socket file is struct socket *.
@@ -274,14 +274,20 @@ int trace_accept4_exit(struct trace_event_raw_sys_exit *ctx) {
     __u64 skaddr = fd_to_skaddr(fd);
     struct sock *sk = (struct sock *)skaddr;
 
-    __u32 src_ip   = sk ? BPF_CORE_READ(sk, sk_rcv_saddr) : 0;
-    __u32 dst_ip   = sk ? BPF_CORE_READ(sk, sk_daddr)     : 0;
-    __u16 src_port = sk ? BPF_CORE_READ(sk, sk_num)        : 0;
-    __u16 dst_port = sk ? BPF_CORE_READ(sk, sk_dport)      : 0;
+    __u32 src_ip   = 0;
+    __u32 dst_ip   = 0;
+    __u16 src_port = 0;
+    __u16 dst_port = 0;
 
-    // sk_num is in host byte order; convert to network byte order to match
-    // how all other ports are stored in conn_info.
-    src_port = bpf_htons(src_port);
+    if (sk) {
+        src_ip   = BPF_CORE_READ(sk, __sk_common.skc_rcv_saddr);
+        dst_ip   = BPF_CORE_READ(sk, __sk_common.skc_daddr);
+        // skc_num is the local port in host byte order; convert to network
+        // byte order to match how all other ports are stored in conn_info.
+        src_port = bpf_htons(BPF_CORE_READ(sk, __sk_common.skc_num));
+        // skc_dport is already in network byte order — assign directly.
+        dst_port = BPF_CORE_READ(sk, __sk_common.skc_dport);
+    }
 
     struct conn_info conn_info = {
         .src_ip         = src_ip,
@@ -338,9 +344,12 @@ int trace_inet_sock_set_state(struct trace_event_raw_inet_sock_set_state *ctx) {
         __builtin_memcpy(&conn->src_ip, ctx->saddr, sizeof(conn->src_ip));
         __builtin_memcpy(&conn->dst_ip, ctx->daddr, sizeof(conn->dst_ip));
 
-        // sport / dport are __u16 in network byte order — assign directly.
-        conn->src_port = ctx->sport;
-        conn->dst_port = ctx->dport;
+        // The inet_sock_set_state tracepoint stores sport / dport in host byte
+        // order (the kernel calls ntohs() before writing the trace event).
+        // Convert back to network byte order to match the convention used
+        // everywhere else in conn_info (sin_port, skc_dport, etc.).
+        conn->src_port = bpf_htons(ctx->sport);
+        conn->dst_port = bpf_htons(ctx->dport);
 
         // FIX: stamp established_ns here, not at connect_exit.  connect_exit
         // fires at EINPROGRESS — before the handshake.  This handler fires when
