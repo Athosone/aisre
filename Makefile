@@ -2,6 +2,7 @@
 
 # Unwrapped clang (Nix-wrapped clang injects flags incompatible with -target bpf)
 CLANG ?= $(shell find /nix/store -maxdepth 3 -name 'clang' -path '*/bin/clang' ! -path '*wrapper*' 2>/dev/null | head -1)
+LIBBPF_INCLUDE ?= $(shell pkg-config --variable=includedir libbpf 2>/dev/null)
 BPF_CFLAGS := -target bpf -O2 -g -Wall -I ebpf/c $(shell pkg-config --cflags libbpf)
 
 DOCKER_COMPOSE := docker compose -f deploy/docker/docker-compose.yml
@@ -25,7 +26,8 @@ compile-bpf:
 # Run bpf2go to compile eBPF C and generate Go bindings
 generate-ebpf:
 	@test -n "$(CLANG)" || (echo "ERROR: unwrapped clang not found in /nix/store. Run: nix develop" && exit 1)
-	cd ebpf && CC=$(CLANG) go generate ./...
+	@test -n "$(LIBBPF_INCLUDE)" || (echo "ERROR: libbpf headers not found via pkg-config. Run: nix develop" && exit 1)
+	cd ebpf && CPATH="$(LIBBPF_INCLUDE):$$CPATH" CC=$(CLANG) go generate ./...
 
 generate: generate-proto generate-ebpf
 
