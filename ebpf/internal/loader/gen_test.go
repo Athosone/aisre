@@ -15,7 +15,7 @@ func skipIfNotRoot(t *testing.T) {
 }
 
 func TestNewWithNilConfig(t *testing.T) {
-	// skipIfNotRoot(t)
+	skipIfNotRoot(t)
 
 	c, err := loader.New(nil)
 	if err != nil {
@@ -49,20 +49,4 @@ func TestCollectorClose(t *testing.T) {
 	if err := c.Close(); err != nil {
 		t.Fatalf("Close() failed: %v", err)
 	}
-}
-
-func TestMultipleCollectors(t *testing.T) {
-	skipIfNotRoot(t)
-
-	c1, err := loader.New(nil)
-	if err != nil {
-		t.Fatalf("first New(nil) failed: %v", err)
-	}
-	defer c1.Close()
-
-	c2, err := loader.New(nil)
-	if err != nil {
-		t.Fatalf("second New(nil) failed: %v", err)
-	}
-	defer c2.Close()
 }

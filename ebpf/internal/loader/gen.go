@@ -148,6 +148,10 @@ func loadCollectorHttpCapture(tcpObjs *tcpTrackerObjects) (*httpCaptureObjects, 
 	return objs, nil
 }
 
+func (c *Collector) RingReader() *ringbuf.Reader {
+	return c.ringReader
+}
+
 func (c *Collector) Close() error {
 	for _, l := range c.links {
 		if err := l.Close(); err != nil {
