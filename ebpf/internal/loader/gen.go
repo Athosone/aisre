@@ -39,91 +39,129 @@ func New(cfg *Config) (*Collector, error) {
 	}
 	c := &Collector{}
 
+	cleanup := func(c *Collector) {
+		if c.ringReader != nil {
+			c.ringReader.Close()
+		}
+		if c.tcpObjs != nil {
+			c.tcpObjs.Close()
+		}
+		if c.httpObjs != nil {
+			c.httpObjs.Close()
+		}
+		for _, l := range c.links {
+			l.Close()
+		}
+	}
 	t, err := loadCollectorHttpTCPTracker()
 	if err != nil {
+		cleanup(c)
 		return nil, fmt.Errorf("loading tcp tracker: %w", err)
 	}
 	c.tcpObjs = t
 
 	h, err := loadCollectorHttpCapture(c.tcpObjs)
 	if err != nil {
+		cleanup(c)
 		return nil, fmt.Errorf("loading http capture: %w", err)
 	}
 	c.httpObjs = h
 
-	l, err := link.Tracepoint("syscalls", "sys_enter_connect", c.tcpObjs.TraceConnect, nil)
+	links, err := createLinks(c)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %w", ErrTCPTrackerTraceLink, err)
+		cleanup(c)
+		return nil, fmt.Errorf("creating links: %w", err)
 	}
-	c.links = append(c.links, l)
+	c.links = links
 
-	l, err = link.Tracepoint("syscalls", "sys_exit_connect", c.tcpObjs.TraceConnectExit, nil)
+	c.ringReader, err = ringbuf.NewReader(c.tcpObjs.Events)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %w", ErrTCPTrackerTraceLink, err)
+		cleanup(c)
+		return nil, fmt.Errorf("creating ring reader: %w", err)
 	}
-	c.links = append(c.links, l)
-
-	l, err = link.Tracepoint("syscalls", "sys_enter_accept4", c.tcpObjs.TraceAccept4Enter, nil)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %w", ErrTCPTrackerTraceLink, err)
-	}
-	c.links = append(c.links, l)
-
-	l, err = link.Tracepoint("syscalls", "sys_exit_accept4", c.tcpObjs.TraceAccept4Exit, nil)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %w", ErrTCPTrackerTraceLink, err)
-	}
-	c.links = append(c.links, l)
-
-	l, err = link.Tracepoint("syscalls", "sys_enter_read", c.httpObjs.TracepointSysEnterRead, nil)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %w", ErrHTTPTrackerTraceLink, err)
-	}
-	c.links = append(c.links, l)
-
-	l, err = link.Tracepoint("syscalls", "sys_exit_read", c.httpObjs.TracepointSysExitRead, nil)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %w", ErrHTTPTrackerTraceLink, err)
-	}
-	c.links = append(c.links, l)
-
-	l, err = link.Tracepoint("syscalls", "sys_enter_write", c.httpObjs.TracepointSysEnterWrite, nil)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %w", ErrHTTPTrackerTraceLink, err)
-	}
-	c.links = append(c.links, l)
-
-	l, err = link.Tracepoint("syscalls", "sys_exit_write", c.httpObjs.TracepointSysExitWrite, nil)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %w", ErrHTTPTrackerTraceLink, err)
-	}
-	c.links = append(c.links, l)
-
-	l, err = link.Tracepoint("syscalls", "sys_enter_recvfrom", c.httpObjs.TracepointSysEnterRecvfrom, nil)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %w", ErrHTTPTrackerTraceLink, err)
-	}
-	c.links = append(c.links, l)
-
-	l, err = link.Tracepoint("syscalls", "sys_exit_recvfrom", c.httpObjs.TracepointSysExitRecvfrom, nil)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %w", ErrHTTPTrackerTraceLink, err)
-	}
-	c.links = append(c.links, l)
-
-	l, err = link.Tracepoint("syscalls", "sys_enter_sendto", c.httpObjs.TracepointSysEnterSendto, nil)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %w", ErrHTTPTrackerTraceLink, err)
-	}
-	c.links = append(c.links, l)
-
-	l, err = link.Tracepoint("syscalls", "sys_exit_sendto", c.httpObjs.TracepointSysExitSendto, nil)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %w", ErrHTTPTrackerTraceLink, err)
-	}
-	c.links = append(c.links, l)
 
 	return c, nil
+}
+
+func createLinks(c *Collector) ([]link.Link, error) {
+	var links []link.Link
+	cleanup := func(links []link.Link) {
+		for _, l := range links {
+			l.Close()
+		}
+	}
+	attach := func(tpCategory, tpName string, prog *ebpf.Program) error {
+		l, err := link.Tracepoint(tpCategory, tpName, prog, nil)
+		if err != nil {
+			return fmt.Errorf("linking to tracepoint %s:%s: %w", tpCategory, tpName, err)
+		}
+		links = append(links, l)
+		return nil
+	}
+
+	if err := attach("syscalls", "sys_enter_connect", c.tcpObjs.TraceConnect); err != nil {
+		cleanup(links)
+		return nil, err
+	}
+
+	if err := attach("syscalls", "sys_exit_connect", c.tcpObjs.TraceConnectExit); err != nil {
+		cleanup(links)
+		return nil, err
+	}
+
+	if err := attach("syscalls", "sys_enter_accept4", c.tcpObjs.TraceAccept4Enter); err != nil {
+		cleanup(links)
+		return nil, err
+	}
+	if err := attach("syscalls", "sys_exit_accept4", c.tcpObjs.TraceAccept4Exit); err != nil {
+		cleanup(links)
+		return nil, err
+	}
+	if err := attach("sock", "inet_sock_set_state", c.tcpObjs.TraceInetSockSetState); err != nil {
+		cleanup(links)
+		return nil, err
+	}
+
+	if err := attach("syscalls", "sys_enter_read", c.httpObjs.TracepointSysEnterRead); err != nil {
+		cleanup(links)
+		return nil, err
+	}
+
+	if err := attach("syscalls", "sys_exit_read", c.httpObjs.TracepointSysExitRead); err != nil {
+		cleanup(links)
+		return nil, err
+	}
+
+	if err := attach("syscalls", "sys_enter_write", c.httpObjs.TracepointSysEnterWrite); err != nil {
+		cleanup(links)
+		return nil, err
+	}
+
+	if err := attach("syscalls", "sys_exit_write", c.httpObjs.TracepointSysExitWrite); err != nil {
+		cleanup(links)
+		return nil, err
+	}
+
+	if err := attach("syscalls", "sys_enter_recvfrom", c.httpObjs.TracepointSysEnterRecvfrom); err != nil {
+		cleanup(links)
+		return nil, err
+	}
+
+	if err := attach("syscalls", "sys_exit_recvfrom", c.httpObjs.TracepointSysExitRecvfrom); err != nil {
+		cleanup(links)
+		return nil, err
+	}
+
+	if err := attach("syscalls", "sys_enter_sendto", c.httpObjs.TracepointSysEnterSendto); err != nil {
+		cleanup(links)
+		return nil, err
+	}
+	if err := attach("syscalls", "sys_exit_sendto", c.httpObjs.TracepointSysExitSendto); err != nil {
+		cleanup(links)
+		return nil, err
+	}
+
+	return links, nil
 }
 
 func loadCollectorHttpTCPTracker() (*tcpTrackerObjects, error) {
@@ -142,6 +180,8 @@ func loadCollectorHttpCapture(tcpObjs *tcpTrackerObjects) (*httpCaptureObjects, 
 			"pending_connect_map": tcpObjs.PendingConnectMap,
 			"config_map":          tcpObjs.ConfigMap,
 			"active_syscall_map":  tcpObjs.ActiveSyscallMap,
+			"events":              tcpObjs.Events,
+			"payload_scratch":     tcpObjs.PayloadScratch,
 		}}); err != nil {
 		return nil, fmt.Errorf("loading http capture objects: %w", err)
 	}
@@ -153,16 +193,26 @@ func (c *Collector) RingReader() *ringbuf.Reader {
 }
 
 func (c *Collector) Close() error {
-	for _, l := range c.links {
-		if err := l.Close(); err != nil {
-			return fmt.Errorf("closing link: %w", err)
+	var errs []error
+	if c.ringReader != nil {
+		if err := c.ringReader.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("closing ring reader: %w", err))
 		}
 	}
-	if err := c.tcpObjs.Close(); err != nil {
-		return fmt.Errorf("closing tcp tracker objects: %w", err)
+	for _, l := range c.links {
+		if err := l.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("closing link: %w", err))
+		}
 	}
-	if err := c.httpObjs.Close(); err != nil {
-		return fmt.Errorf("closing http capture objects: %w", err)
+	if c.httpObjs != nil {
+		if err := c.httpObjs.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("closing http capture objects: %w", err))
+		}
 	}
-	return nil
+	if c.tcpObjs != nil {
+		if err := c.tcpObjs.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("closing tcp tracker objects: %w", err))
+		}
+	}
+	return errors.Join(errs...)
 }
