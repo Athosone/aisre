@@ -3,6 +3,7 @@ package loader
 import (
 	"errors"
 	"fmt"
+	"structs"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
@@ -24,9 +25,13 @@ type Collector struct {
 }
 
 type Config struct {
+	_                   structs.HostLayout
+	LogicalCaptureBytes uint32
 }
 
-var defaultConfig = &Config{}
+var defaultConfig = &Config{
+	LogicalCaptureBytes: 512,
+}
 
 func New(cfg *Config) (*Collector, error) {
 	if cfg == nil {
@@ -66,6 +71,12 @@ func New(cfg *Config) (*Collector, error) {
 		return nil, fmt.Errorf("loading http capture: %w", err)
 	}
 	c.httpObjs = h
+
+	// Before config map is nil after creating links we can receive events
+	if err := c.writeConfig(cfg); err != nil {
+		cleanup(c)
+		return nil, fmt.Errorf("writing config: %w", err)
+	}
 
 	links, err := createLinks(c)
 	if err != nil {
@@ -215,4 +226,13 @@ func (c *Collector) Close() error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+func (c *Collector) writeConfig(cfg *Config) error {
+	key := uint32(0)
+	val := tcpTrackerConfig{
+		LogicalCaptureBytes: cfg.LogicalCaptureBytes,
+	}
+	// Could be either tcp or http as we replace the map of http
+	return c.tcpObjs.ConfigMap.Update(key, val, ebpf.UpdateAny)
 }
